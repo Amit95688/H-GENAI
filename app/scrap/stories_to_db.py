@@ -1,16 +1,9 @@
 """
-Fetch exactly top 5 + best 5 stories from Hacker News, replace what is in
-our local DB with these 10, then summarize each story with an LLM and
-store the summary back into the DB.
-
-- DB models: TopStories, BestStories (see app.database.databse)
-- Only keep 5 rows in each table (we delete all and insert fresh 5)
-- LLM: local Ollama (Llama) summarizer
+Fetch top & best stories from Hacker News and save them into local SQLite
+using the SQLAlchemy models defined in app.database.database.
 """
 
-import os
 from sqlalchemy.orm import Session
-import requests
 
 from app.database.database import (
     engine,
@@ -20,54 +13,59 @@ from app.database.database import (
     SummariesBestStories,
 )
 from app.scrap.scrap import get_top_stories, get_best_stories
-
-OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://localhost:11434")
-SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "llama3.2:3b")  # one local Llama model
+from app.agents.summarize_stories import summarize_text
 
 
-def summarize_text(url: str, title: str | None = None) -> str:
-    """Fetch the page at `url`, extract text, and call Ollama to summarize it.
+def save_top_stories(stories: list[dict]):
+    """Save or update top stories in the database."""
+    with Session(engine) as session:
+        for story in stories:
+            story_id = story.get("id")
+            if not story_id:
+                continue
 
-    If fetching or the LLM fails, return a short fallback summary using the
-    provided `title` and `url` so the DB always contains something useful.
-    """
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        html = resp.text
-        try:
-            from bs4 import BeautifulSoup
+            existing = session.get(TopStories, story_id)
+            if existing:
+                existing.title = story.get("title")
+                existing.author = story.get("author")
+                existing.score = story.get("score")
+                existing.url = story.get("url")
+            else:
+                new_story = TopStories(
+                    id=story_id,
+                    title=story.get("title"),
+                    author=story.get("author"),
+                    score=story.get("score"),
+                    url=story.get("url"),
+                )
+                session.add(new_story)
+        session.commit()
 
-            soup = BeautifulSoup(html, "html.parser")
-            page_text = soup.get_text(separator="\n")
-        except Exception:
-            # Fallback: strip tags naively
-            import re
 
-            page_text = re.sub(r"<[^>]+>", "", html)
+def save_best_stories(stories: list[dict]):
+    """Save or update best stories in the database."""
+    with Session(engine) as session:
+        for story in stories:
+            story_id = story.get("id")
+            if not story_id:
+                continue
 
-        # Keep the prompt reasonably sized
-        snippet = page_text.strip()[:4000]
-        prompt = (
-            f"Summarize the main points of the following web page in 2-3 sentences, plain text:\n\nURL: {url}\n\n{snippet}\n\nSummary:"
-        )
-
-        r = requests.post(
-            f"{OLLAMA_BASE}/api/generate",
-            json={"model": SUMMARY_MODEL, "prompt": prompt, "stream": False},
-            timeout=60,
-        )
-        r.raise_for_status()
-        return (r.json().get("response") or "").strip()
-    except Exception as e:
-        # Fallback: return a concise summary made from title + url when
-        # the LLM or fetch fails so we don't store opaque error blobs.
-        if title:
-            return f"{title} — {url}"
-        if url:
-            return f"Summary unavailable; see {url}"
-        return "Summary unavailable"
-
+            existing = session.get(BestStories, story_id)
+            if existing:
+                existing.title = story.get("title")
+                existing.author = story.get("author")
+                existing.score = story.get("score")
+                existing.url = story.get("url")
+            else:
+                new_story = BestStories(
+                    id=story_id,
+                    title=story.get("title"),
+                    author=story.get("author"),
+                    score=story.get("score"),
+                    url=story.get("url"),
+                )
+                session.add(new_story)
+        session.commit()
 
 def refresh_db_with_top_and_best():
     """Keep only top 5 + best 5 in DB (replace previous rows)."""
@@ -92,6 +90,7 @@ def refresh_db_with_top_and_best():
             )
             session.add(story)
 
+            # create summary record keyed by story id (top stories table)
             summary_text = summarize_text(url or "", s.get("title")) if url else (s.get("title") or "[no url]")
             summary_row = SummariesTopStories(id=sid, url=url or "", summary=summary_text)
             session.merge(summary_row)
