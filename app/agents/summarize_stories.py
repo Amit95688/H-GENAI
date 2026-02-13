@@ -1,16 +1,17 @@
-"""
-Fetch exactly top 5 + best 5 stories from Hacker News, replace what is in
-our local DB with these 10, then summarize each story with an LLM and
-store the summary back into the DB.
-
-- DB models: TopStories, BestStories (see app.database.databse)
-- Only keep 5 rows in each table (we delete all and insert fresh 5)
-- LLM: local Ollama (Llama) summarizer
-"""
+from __future__ import annotations
 
 import os
+import concurrent.futures
+from typing import Optional
+
+from dotenv import load_dotenv
 from sqlalchemy.orm import Session
-import requests
+
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.llms import Ollama
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
 
 from app.database.database import (
     engine,
@@ -21,106 +22,155 @@ from app.database.database import (
 )
 from app.scrap.scrap import get_top_stories, get_best_stories
 
+
+# ==============================
+# CONFIG
+# ==============================
+
+load_dotenv()
+
 OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://localhost:11434")
-SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "llama3.2:3b")  # one local Llama model
+SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "llama3.2:3b")
+MAX_WORKERS = int(os.getenv("SUMMARY_WORKERS", 4))
 
 
-def summarize_text(url: str, title: str | None = None) -> str:
-    """Fetch the page at `url`, extract text, and call Ollama to summarize it.
+# ==============================
+# GLOBAL LLM (reuse instance)
+# ==============================
 
-    If fetching or the LLM fails, return a short fallback summary using the
-    provided `title` and `url` so the DB always contains something useful.
-    """
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        html = resp.text
-        try:
-            from bs4 import BeautifulSoup
+llm = Ollama(
+    base_url=OLLAMA_BASE,
+    model=SUMMARY_MODEL,
+    temperature=0.2,
+)
 
-            soup = BeautifulSoup(html, "html.parser")
-            page_text = soup.get_text(separator="\n")
-        except Exception:
-            # Fallback: strip tags naively
-            import re
+prompt = PromptTemplate.from_template(
+    "You are a concise technical summarizer.\n\n"
+    "Context:\n{context}\n\n"
+    "Provide:\n"
+    "- 2-3 sentence summary\n"
+    "- 3 bullet points\n"
+)
 
-            page_text = re.sub(r"<[^>]+>", "", html)
+chain = prompt | llm | StrOutputParser()
 
-        # Keep the prompt reasonably sized
-        snippet = page_text.strip()[:4000]
-        prompt = (
-            f"Summarize the main points of the following web page in 2-3 sentences, plain text:\n\nURL: {url}\n\n{snippet}\n\nSummary:"
-        )
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1500,
+    chunk_overlap=200,
+)
 
-        r = requests.post(
-            f"{OLLAMA_BASE}/api/generate",
-            json={"model": SUMMARY_MODEL, "prompt": prompt, "stream": False},
-            timeout=60,
-        )
-        r.raise_for_status()
-        return (r.json().get("response") or "").strip()
-    except Exception as e:
-        # Fallback: return a concise summary made from title + url when
-        # the LLM or fetch fails so we don't store opaque error blobs.
-        if title:
-            return f"{title} — {url}"
-        if url:
-            return f"Summary unavailable; see {url}"
+
+# ==============================
+# SUMMARIZATION
+# ==============================
+
+def summarize_url(url: Optional[str]) -> str:
+    if not url:
         return "Summary unavailable"
 
+    try:
+        loader = WebBaseLoader(url)
+        docs = loader.load()
+
+        splits = splitter.split_documents(docs)
+
+        # Limit context size (avoid huge prompts)
+        context = "\n\n".join(d.page_content for d in splits[:4])
+
+        return chain.invoke({"context": context})
+
+    except Exception:
+        return f"Summary unavailable for {url}"
+
+
+# ==============================
+# PARALLEL PROCESSING
+# ==============================
+
+def process_story(story: dict) -> tuple[int, str, str]:
+    sid = story["id"]
+    url = story.get("url")
+    summary = summarize_url(url) if url else (story.get("title") or "Summary unavailable")
+    return sid, url or "", summary
+
+
+# ==============================
+# DB REFRESH
+# ==============================
 
 def refresh_db_with_top_and_best():
-    """Keep only top 5 + best 5 in DB (replace previous rows)."""
+
     top = get_top_stories(limit=5)
     best = get_best_stories(limit=5)
 
     with Session(engine) as session:
-        # Clear existing rows so we only ever have 5 of each
+
+        # Clear old data
         session.query(TopStories).delete()
         session.query(BestStories).delete()
+        session.query(SummariesTopStories).delete()
+        session.query(SummariesBestStories).delete()
+        session.commit()
 
-        # Insert new top 5 and generate summaries stored in `summaries` table
+        # Insert stories first (fast)
         for s in top:
-            sid = s.get("id")
-            url = s.get("url")
-            story = TopStories(
-                id=sid,
-                title=s.get("title"),
-                author=s.get("author"),
-                score=s.get("score"),
-                url=url,
+            session.add(
+                TopStories(
+                    id=s["id"],
+                    title=s.get("title"),
+                    author=s.get("author"),
+                    score=s.get("score"),
+                    url=s.get("url"),
+                )
             )
-            session.add(story)
 
-            summary_text = summarize_text(url or "", s.get("title")) if url else (s.get("title") or "[no url]")
-            summary_row = SummariesTopStories(id=sid, url=url or "", summary=summary_text)
-            session.merge(summary_row)
-
-        # Insert new best 5 and generate summaries stored in `summaries` table
         for s in best:
-            sid = s.get("id")
-            url = s.get("url")
-            story = BestStories(
-                id=sid,
-                title=s.get("title"),
-                author=s.get("author"),
-                score=s.get("score"),
-                url=url,
+            session.add(
+                BestStories(
+                    id=s["id"],
+                    title=s.get("title"),
+                    author=s.get("author"),
+                    score=s.get("score"),
+                    url=s.get("url"),
+                )
             )
-            session.add(story)
 
-            summary_text = summarize_text(url or "", s.get("title")) if url else (s.get("title") or "[no url]")
-            summary_row = SummariesBestStories(id=sid, url=url or "", summary=summary_text)
-            session.merge(summary_row)
+        session.commit()
+
+        # Parallel summarization
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+
+            # Top stories summaries
+            futures_top = [executor.submit(process_story, s) for s in top]
+            for future in concurrent.futures.as_completed(futures_top):
+                sid, url, summary = future.result()
+                session.merge(
+                    SummariesTopStories(
+                        id=sid,
+                        url=url,
+                        summary=summary,
+                    )
+                )
+
+            # Best stories summaries
+            futures_best = [executor.submit(process_story, s) for s in best]
+            for future in concurrent.futures.as_completed(futures_best):
+                sid, url, summary = future.result()
+                session.merge(
+                    SummariesBestStories(
+                        id=sid,
+                        url=url,
+                        summary=summary,
+                    )
+                )
 
         session.commit()
 
 
-def main():
-    """Entry point: refresh DB and summarize."""
-    refresh_db_with_top_and_best()
-    print("✅ Top 5 + Best 5 stories saved and summarized in DB (hn_stories.db).")
-
+# ==============================
+# ENTRYPOINT
+# ==============================
 
 if __name__ == "__main__":
-    main()
+    refresh_db_with_top_and_best()
+    print("✅ DB refreshed with parallel LLM summaries.")

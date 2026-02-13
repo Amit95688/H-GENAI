@@ -1,8 +1,22 @@
-from sqlalchemy import create_engine, String, Integer, Text
+from sqlalchemy import create_engine, String, Integer, Text, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # SQLite database for local storage
-engine = create_engine("sqlite:///hn_stories.db", echo=False)
+engine = create_engine(
+    "sqlite:///hn_stories.db",
+    echo=False,
+    connect_args={"timeout": 30},
+)
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+    finally:
+        cursor.close()
 
 # Modern SQLAlchemy Base
 class Base(DeclarativeBase):
